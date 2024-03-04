@@ -6,16 +6,15 @@ package plugin
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/sagemaker"
 	"github.com/aws/aws-sdk-go-v2/service/sagemaker/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/sirupsen/logrus"
 )
 
@@ -50,21 +49,29 @@ func Exec(ctx context.Context, args Args) error {
 	}
 
 	var err error
+	var cfg aws.Config
 
 	if args.Username == "AWS" && args.Password == "" {
-		args.Password, err = getAWSPassword(args.AwsAccessKeyID, args.AwsSecretAcessKey, args.AwsRegion)
+		creds, err := getAWSTemporaryCredentials(args.AwsAccessKeyID, args.AwsSecretAcessKey, args.AwsRegion)
 		if err != nil {
-			return fmt.Errorf("failed to get login to AWS")
+			return fmt.Errorf("failed to get login to AWS: %w", err)
 		}
-	}
 
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(args.AwsRegion),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(args.Username, args.Password, "")),
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to load configuration: %w", err)
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithRegion(args.AwsRegion),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(*creds.AccessKeyId, *creds.SecretAccessKey, *creds.SessionToken)),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to load configuration with temporary credentials: %w", err)
+		}
+	} else {
+		cfg, err = config.LoadDefaultConfig(ctx,
+			config.WithRegion(args.AwsRegion),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(args.Username, args.Password, "")),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to load configuration: %w", err)
+		}
 	}
 
 	smClient := sagemaker.NewFromConfig(cfg)
@@ -72,17 +79,18 @@ func Exec(ctx context.Context, args Args) error {
 	if err := createModel(ctx, smClient, args); err != nil {
 		return err
 	}
-	logrus.Info("Model created successfully")
+	fmt.Println("Model created successfully")
 
 	if err := createEndpointConfig(ctx, smClient, args); err != nil {
 		return err
 	}
-	logrus.Info("Endpoint config created successfully")
+	fmt.Println("Endpoint config created successfully")
 
 	if err := deployEndpoint(ctx, smClient, args); err != nil {
 		return err
 	}
-	logrus.Info("Endpoint deployed successfully")
+	fmt.Println("Endpoint deployed successfully")
+	fmt.Println("SageMaker deployment completed successfully")
 
 	return nil
 }
@@ -137,9 +145,9 @@ func deployEndpoint(ctx context.Context, smClient *sagemaker.Client, args Args) 
 	return nil
 }
 
-func getAWSPassword(accessKeyID, secretAccessKey, region string) (string, error) {
+func getAWSTemporaryCredentials(accessKeyID, secretAccessKey, region string) (*ststypes.Credentials, error) {
 	if accessKeyID == "" || secretAccessKey == "" || region == "" {
-		return "", fmt.Errorf("aws credentials not provided")
+		return nil, fmt.Errorf("AWS credentials not provided")
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
@@ -147,31 +155,18 @@ func getAWSPassword(accessKeyID, secretAccessKey, region string) (string, error)
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")),
 	)
 	if err != nil {
-		return "", fmt.Errorf("failed to load aws config: %w", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	svc := ecr.NewFromConfig(cfg)
+	stsClient := sts.NewFromConfig(cfg)
+	input := &sts.GetSessionTokenInput{}
 
-	input := &ecr.GetAuthorizationTokenInput{}
-	result, err := svc.GetAuthorizationToken(context.TODO(), input)
+	result, err := stsClient.GetSessionToken(context.TODO(), input)
 	if err != nil {
-		fmt.Println("Error getting authorization token:", err)
-		return "", err
+		return nil, fmt.Errorf("failed to get session token: %w", err)
 	}
 
-	var awsToken string
+	logrus.Info("Successfully retrieved AWS temporary credentials\n")
 
-	for _, data := range result.AuthorizationData {
-		token, err := base64.StdEncoding.DecodeString(*data.AuthorizationToken)
-		if err != nil {
-			fmt.Println("Error decoding token:", err)
-			return "", err
-		}
-
-		awsToken = string(token)
-	}
-
-	logrus.Info("successfully retrieved aws token\n")
-
-	return strings.Split(awsToken, ":")[1], nil
+	return result.Credentials, nil
 }
